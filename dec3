@@ -1,0 +1,157 @@
+import math
+
+icao_data = {}  # Global dictionary to store data per ICAO address
+
+def calculate_position(j, Nz, LATcpr_even, LATcpr_odd):
+    LAT_even = (360 / (4 * Nz)) * ((j % 60) + LATcpr_even)
+    LAT_odd = (360 / (4 * Nz - 1)) * ((j % 59) + LATcpr_odd)
+
+    def get_NL(lat):
+        if abs(lat) >= 87:
+            return 1
+        a = 1 - math.cos(math.pi / (2 * Nz))
+        b = math.cos(math.pi / 180 * lat) ** 2
+        denominator = 1 - a / b
+        return math.floor(2 * math.pi / math.acos(denominator))
+
+    NL_LAT_even = get_NL(LAT_even)
+    NL_LAT_odd = get_NL(LAT_odd)
+
+    return LAT_even, LAT_odd, NL_LAT_even, NL_LAT_odd
+
+def decode_velocity_message(binary_msg, ST):
+    velocity_data = {}
+    if ST == 1:
+        S_ew = int(binary_msg[45:46], 2)
+        V_ew = int(binary_msg[46:56], 2)
+        S_ns = int(binary_msg[56:57], 2)
+        V_ns = int(binary_msg[57:67], 2)
+
+        V_x = V_ew - 1 if S_ew == 0 else -(V_ew - 1)
+        V_y = V_ns - 1 if S_ns == 0 else -(V_ns - 1)
+        V = math.sqrt(V_x ** 2 + V_y ** 2)
+
+        print(f"THE FINAL GROUND SPEED OF THE AIRCRAFT: {V:.2f} ft/min")
+
+        velocity_data = {
+            'type': 'Ground Speed',
+            'vx': V_x,
+            'vy': V_y,
+            'speed': round(V, 2)
+        }
+
+    elif ST == 3:
+        SH = int(binary_msg[45:46], 2)
+        AS = int(binary_msg[57:67], 2)
+
+        if SH == 1:
+            HDG = int(binary_msg[46:56], 2)
+            mag_heading = HDG * (360 / 1024)
+            Vas = AS - 1
+            print(f"Magnetic Heading: {mag_heading:.2f}°")
+            print(f"Airspeed: {Vas}")
+
+            velocity_data = {
+                'type': 'Heading and Airspeed',
+                'heading': round(mag_heading, 2),
+                'airspeed': Vas
+            }
+        else:
+            print("Heading data not available.")
+            velocity_data = {'type': 'Heading not available'}
+
+    else:
+        print("Unsupported subtype for velocity message.")
+        velocity_data = {'type': 'Unsupported'}
+
+    return velocity_data
+
+def decode_adsb(hex_message):
+    binary_msg = bin(int(hex_message, 16))[2:].zfill(len(hex_message) * 4)
+    type_code = int(binary_msg[32:37], 2)
+    icao_address = hex_message[2:8]
+    print(f"\nRaw Message: {hex_message}")
+    print(f"ICAO_address : {icao_address}")
+    print(f"Type code: {type_code}")
+
+    if icao_address not in icao_data:
+        icao_data[icao_address] = {'even': None, 'odd': None, 'velocity': None}
+
+    if 9 <= type_code <= 18:
+        F = int(binary_msg[53], 2)
+
+        Alt = binary_msg[40:52]
+        N = int((Alt[:7] + Alt[8:12]), 2)
+        h = 25 * N - 1000
+        print(f"ALTITUDE : {h} ft")
+
+        if F == 0:
+            Ncpr_lat1 = int(binary_msg[54:71], 2)
+            LATcpr_even = Ncpr_lat1 / 2 ** 17
+            Ncpr_lon1 = int(binary_msg[71:88], 2)
+            LONcpr_even = Ncpr_lon1 / 2 ** 17
+            return 'even', icao_address, LATcpr_even, LONcpr_even
+        elif F == 1:
+            Ncpr_lat2 = int(binary_msg[54:71], 2)
+            LATcpr_odd = Ncpr_lat2 / 2 ** 17
+            Ncpr_lon2 = int(binary_msg[71:88], 2)
+            LONcpr_odd = Ncpr_lon2 / 2 ** 17
+            return 'odd', icao_address, LATcpr_odd, LONcpr_odd
+
+    elif type_code == 19:
+        print("Velocity message")
+        ST = int(binary_msg[37:40], 2)
+        velocity_data = decode_velocity_message(binary_msg, ST)
+        return 'Velocity', icao_address, velocity_data, None
+
+    return None, icao_address, None, None
+
+def proccess_adsb_messages(messages):
+    for msg in messages:
+        format_type, icao_address, val1, val2 = decode_adsb(msg)
+
+        if format_type == 'even':
+            icao_data[icao_address]['even'] = (val1, val2)
+        elif format_type == 'odd':
+            icao_data[icao_address]['odd'] = (val1, val2)
+        elif format_type == 'Velocity':
+            icao_data[icao_address]['velocity'] = val1
+
+    for icao_address, data in icao_data.items():
+        print(f"\n--- ICAO Address: {icao_address} ---")
+
+        even_data = data['even']
+        odd_data = data['odd']
+        vel = data['velocity']
+
+        if even_data and odd_data:
+            LATcpr_even, LONcpr_even = even_data
+            LATcpr_odd, LONcpr_odd = odd_data
+            Nz = 15
+            j = math.floor((59 * LATcpr_even - 60 * LATcpr_odd) + 0.5)
+            LAT_even, LAT_odd, NL_lat_even, NL_lat_odd = calculate_position(j, Nz, LATcpr_even, LATcpr_odd)
+            m = math.floor((LONcpr_even * (NL_lat_even - 1) - LONcpr_odd * (NL_lat_odd)) + 0.5)
+            n_even = max(NL_lat_even, 1)
+            LON = 360 / n_even * ((m % n_even) + LONcpr_even)
+
+            print(f"LATITUDE: {LAT_even:.6f}")
+            print(f"LONGITUDE: {LON:.6f}")
+        else:
+            print("Incomplete position data (need both even and odd)")
+
+        if vel:
+            print("Velocity:")
+            for key, val in vel.items():
+                print(f"  {key}: {val}")
+        else:
+            print("No velocity message")
+
+# Sample ADS-B messages
+sample_adsb_messages = [
+    "8D40621D58C382D690C8AC2869A7",  # even
+    "8D40621D58C386435CC412692AD6",  # odd
+    "8D40621D994409940838175B284F",  # velocity ST=1
+    "8DA05F219B06B6AF189400CBC33F"   # velocity ST=3
+]
+
+proccess_adsb_messages(sample_adsb_messages)

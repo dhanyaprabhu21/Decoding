@@ -1,0 +1,392 @@
+
+import math
+# import socket
+
+# def clean_adsb_messages(raw_data):
+#      cleaned_messages = []
+#      lines = raw_data.strip().split('\n')  # Split by newlines
+#      for line in lines:
+#          line = line.strip()
+#          if line.startswith('*') and line.endswith(';') and len(line) == 30:
+#            cleaned = line[1:-1].upper()  # Remove * and ;, convert to uppercase
+#            cleaned_messages.append(cleaned)
+#      return cleaned_messages
+# def receive_adsb_messages(duration=10):
+#      HOST = '127.0.0.1'
+#      PORT = 30002
+#      cleaned_all = []
+
+#      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#          s.connect((HOST, PORT))
+#          print("Connected to Dump1090 on port 30002")
+
+#          import time
+#          start_time = time.time()
+
+#          while True:
+#              data = s.recv(4096)
+#              print(data)
+#              if data:
+#                  adsb = data.decode(errors='ignore')
+#                  cleaned = clean_adsb_messages(adsb)
+#                  cleaned_all.extend(cleaned)
+#                  # print(adsb)
+                
+
+#                  # if cleaned:
+#                  #     print(cleaned)
+
+#              if time.time() - start_time > duration:
+#                  break
+
+#      return cleaned_all
+
+#  # ✅ Get the cleaned messages here
+# all_cleaned_msgs = receive_adsb_messages(duration=10)
+#  # print(all_cleaned_msgs)
+#  # ✅ Now use this in any other function
+# def process_messages(messages):
+#      print(f"Processing {len(messages)} cleaned messages...")
+#      # Do something with the messages here
+
+###############################################################################################################################
+#process_messages(all_cleaned_msgs)
+# --- Position Calculation ---
+def calculate_position(j, Nz, lat_even, lat_odd):
+    lat_even_deg = (360 / (4 * Nz)) * ((j % 60) + lat_even)
+    lat_odd_deg = (360 / (4 * Nz - 1)) * ((j % 59) + lat_odd)
+
+    def NL(lat):
+        if abs(lat) >= 87:
+            return 1
+        a = 1 - math.cos(math.pi / (2 * Nz))
+        b = math.cos(math.radians(lat)) ** 2
+        return math.floor(2 * math.pi / math.acos(1 - a / b))
+
+    return lat_even_deg, lat_odd_deg, NL(lat_even_deg), NL(lat_odd_deg)
+
+# --- Velocity Decoder ---
+def decode_velocity(binary, subtype):
+    result = {}
+    if subtype == 1:
+        VR = int(binary[69:78],2)
+        Svr = int(binary[68])
+        s_ew = int(binary[45])
+        v_ew = int(binary[46:56], 2)
+        s_ns = int(binary[56])
+        v_ns = int(binary[57:67], 2)
+
+        vx = (v_ew - 1) * (-1 if s_ew else 1)
+        vy = (v_ns - 1) * (-1 if s_ns else 1)
+        if Svr==0:
+            VS = 64*(VR-1)
+        else:
+            VS = -64*(VR-1)
+
+        result['ground_speed'] = round(math.sqrt(vx ** 2 + vy ** 2), 2)
+        result['Track_angle'] = round(math.atan2(vx, vy) * (360/(2*math.pi)))
+        result['VS'] = VS
+        
+
+
+
+    return result
+
+# --- ADS-B Message Decoder ---
+def decode_adsb(msg):
+    binary = bin(int(msg, 16))[2:].zfill(len(msg) * 4)
+    icao = msg[2:8]
+    type_code = int(binary[32:37], 2)
+
+    if 9 <= type_code <= 18:  # Position message
+        oe_flag = int(binary[53])
+        lat = int(binary[54:71], 2) / 2 ** 17
+        lon = int(binary[71:88], 2) / 2 ** 17
+
+        alt_bits = binary[40:52]
+        n = int(alt_bits[:7] + alt_bits[8:], 2)
+        altitude = 25 * n - 1000
+
+        return icao, 'odd' if oe_flag else 'even', lat, lon, f"{altitude} ft", None
+
+    elif type_code == 19:  # Velocity message
+        subtype = int(binary[37:40], 2)
+        velocity_info = decode_velocity(binary, subtype)
+        return icao, 'velocity', None, None, None, velocity_info
+
+    return None, None, None, None, None, None
+
+
+# --- Main Processing ---
+def process_adsb_messages(messages):
+    aircraft = {}
+
+    for msg in messages:
+        icao, msg_type, lat, lon, altitude, velocity = decode_adsb(msg)
+        if not icao:
+            continue
+        if icao not in aircraft:
+            aircraft[icao] = {'even': None, 'odd': None, 'altitude': None, 'velocity': {}}
+        if msg_type in ['even', 'odd']:
+            aircraft[icao][msg_type] = (lat, lon)
+            aircraft[icao]['altitude'] = altitude
+        elif msg_type == 'velocity':
+            aircraft[icao]['velocity'].update(velocity)
+
+    Nz = 15
+    for icao, data in aircraft.items():
+        lat_str, lon_str = "N/A", "N/A"
+        if data['even'] and data['odd']:
+            lat_even, lon_even = data['even']
+            lat_odd, lon_odd = data['odd']
+            j = math.floor(59 * lat_even - 60 * lat_odd + 0.5)
+            lat_deg, _, NL_even, NL_odd = calculate_position(j, Nz, lat_even, lat_odd)
+            m = math.floor((lon_even * (NL_even - 1) - lon_odd * NL_odd) + 0.5)
+            n_even = max(NL_even, 1)
+            lon_deg = 360 / n_even * ((m % n_even) + lon_even)
+            lat_str = f"{lat_deg:}"
+            lon_str = f"{lon_deg:}"
+
+        altitude = data['altitude'] or "Unknown"
+        velocity = data['velocity']
+        gs = f"{velocity['ground_speed']} kt" if 'ground_speed' in velocity else "N/A"
+        VS = f"{velocity['VS']} kt" if 'VS' in velocity else "N/A"
+        Track_angle = f"{velocity['Track_angle']}°" if 'Track_angle' in velocity else "N/A"
+        print(f"ICAO: {icao} | Alt: {altitude} | Lat: {lat_str}, Lon: {lon_str} | GS: {gs} | VS: {VS} | Track_angle: {Track_angle}")
+    #print(f"ICAO: {icao} | Altitude: {altitude} ft | Position: LAT {lat:.6f}, LON {lon:.6f} | Ground Speed: {velocity['ground_speed']:.2f} kt | airspeed: {velocity['airspeed']}kt | Magnetic Heading: {velocity['magnetic_heading']}°")
+# --- Example Test Set ---
+data_list =[ #"8D800D4058C38499828DEA2EC184",
+            #    "8D800D4058C38499E48DED326C5D",
+            #    "8D800D4058C3849A508DF0F45AB3",
+            #    "8D800D4058C380C00AFC3B3AD6AD",
+            #    "8D001838FFF02B3D600CE39773DB", # 
+            #    "8D0018388109ED30FFE400409A2D"]
+            #    "*5d801631b4c3de"]
+    "8D485020994409940838175B284F",
+    "8d80163199143c9b70280fc25854",
+    "8d801631ea1b7866313c08e7dad9",
+    "02c188bfca3fed",
+    "8d801410f8230003004ab8b64945",
+    "8d80163199143c9b702c0ffa6e54",
+    "5d801631b4c3de",
+    "8d80163158491080130f678a375b",
+    "02c18d11fa957d",
+    "8d801631f82300000049b8cc3a81",
+    "02c18911c2a15c",
+    "8d801410ea30e85c575c08c27576",
+    "a8000800202473f22a0820f3cd1c",
+    "a800023a9b580030a80000caff87",
+    "a800023ac6095714e0a414838cc5",
+    "200009127eed2d",
+    "200009127eed2d",
+    "20000d1646e13a",
+    "28000800d000de",
+    "5d801631b4c3de",
+    "8d8014105869a4e5f8b1c3ce54a3",
+    "8d801410ea30e85c575c08c27576",
+    "8d801631ea1b7866313c08e7dad9",
+    "a0000914c6095714e0b41824703c",
+    "2800023abd38e0",
+    "a0000d1b8ac9bf1ea2244a204e84",
+    "20000d1bb95d69",
+    "a0000d1bb0d80030a400005f7966",
+    "a0000914fff8ad1c00046cde9d4d",
+    "8d8014105869d4e65cb1e3b8fdc6",
+    "8d801410ea30e85c575c08c27576",
+    "5d801631b4c3de",
+    "8d8014105869e10d3320de2db8d0",
+    "8d8016315849507e790f31684e60",
+    "8d8014109920ad21508421bfe1f8",
+    "a8000800fe717727bff49c2b236c",
+    "20000d31b8f0ae",
+    "8d80163158496459e8a08bc7c310",
+    "5d801631b4c3de",
+    "8d801410586b310e0b2123ce044b",
+    "8d801410ea30e85c575c08c27576",
+    "8d801631ea1b7866313c08e7dad9",
+    "8d801631202473f7cb5e2052e0e0",
+    "8d801410586b410e4121345d80cf",
+    "a0000918c6595514e0ec1d26e8dd",
+    "8d8016315849807d9b0f13a33003",
+    "a0000d34b0d80030a40000f5568b",
+    "8d801631ea1b7866313c08e7dad9",
+    "02c18d340498f2",
+    "a800023ac6595514e0ec1c93d5f4",
+    "a0000d348a59c11f200416d0779d",
+    "28000800d000de",
+    "8d8016315849907d6f0f0d5cbdb8",
+    "5d801631b4c3de",
+    "a0000d3481117928202c9d20dd34",
+    "a8000800b0d80030a4000040a6a2",
+    "20000d34473c91",
+    "2800023abd38e0",
+    "8d8016315849a45904a06cf90477",
+    "a0000d35ff7179287ff49fc2e381",
+    "8d80163199143c9b103c0fd5322f",
+    "a8000800ff517728bff4a1de5e51",
+    "8d8014109920b1221020226d45c8",
+    "a800023ac6395514e0dc1a5e02b2",
+    "8d8014109920b122302023d7cde8",
+    "8d8016315849b07cb30ef4067fe5",
+    "5d80141056ed67",
+    "02c1891c3d1d0f",
+    "8d801410586b64e90ab2be604345",
+    "2000091c7eb96c",
+    "5d801631b4c3de",
+    "8d80163199143b9b10340fac6a45",
+    "8d801410586b74e978b2e1a544bc",
+    "8d801631202473f7cb5e2052e0e0",
+    "8d80163199143b9b1030106b1cd5",
+    "02c18d3804d0a8",
+    "02c18d3804d0a8",
+    "8d80163199143b9b102c10c39ed5",
+    "2000091e7ea577",
+    "8d801410586b84ea22b31719ad4d",
+    "a0000d38805175296004a243ca9b",
+    "8d8014109920b422f024238026e1",
+    "02c18d39fb24a1",
+    "8d801410586b91117b223ce67dfa",
+    "20000d39b880c2",
+    "5d80141056ed67",
+    "200009307f3086",
+    "a0000930c6395514e09c1245eee6",
+    "02c18d3a04ccb3",
+    "8d801631ea1b7866313c08e7dad9",
+    "8d8014109920b923701c23f85890",
+    "8d801410f8230003004ab8b64945",
+    "a0000d3a80f17b2a2014a48fa427",
+    "a80008008ab9d720bff40d4d4d5a",
+    "8d801631584b145678a015022351",
+    "8d80163199143b9b102810fba8d5",
+    "a0000d3a80f17b2a6024a2dbe451",
+    "8d8015c2ea159848015c08ad20dd",
+    "8d801631202473f7cb5e2052e0e0",
+    "8d801631584b207a2b0e9efa3bd9",
+    "8d80163199143b9b102410b3f2d5",
+    "8d8015c2f8230003004ab85b037c",
+    "8d80163199143b9b1020108bc4d5",
+    "8d801631ea1b7866313c08e7dad9",
+    "02c189323c88fe",
+    "02c189323c88fe",
+    "8d8014109920bc23f020238bbbc2",
+    "28000800d000de",
+    "8d801410586bb4ec9eb3e461d4c5",
+    "5d801631b4c3de",
+    "8d801410ea30e85c575c08c27576",
+    "8d80163199143b9b101c101d02dc",
+    "a0000d3c81317d2b2034a693b334",
+    "a0000d3c8a79db20e04c0f8ce846",
+    "28000800d000de",
+    "8d801410586bc4ed4cb41daf7f76",
+    "a0000d3c8a69db20e08413d4759a",
+    "8d801410f8230003004ab8b64945",
+    "8d8014109920c12450302393d8d9",
+    "8d801631584b4454d09fdde6395e",
+    "a000093480b8ad1c00046bec4278",
+    "2800023abd38e0",
+    "8d80163199143b9b102410b3f2d5",
+    "02c189343cacd3",
+    "8d8014109920c2245030246917af",
+    "8d801410586bd4edf6b4559b1684",
+    "8d80163199143c9b102410bac6bf",
+    "8d8014109920c5245030246023c5",
+    "8d801410586be4ee6ab47bd9c211",
+    "a0000d3fb0d80030a400007f01ef",
+    "8d801631584b5078230e5854845a",
+    "8d801410586bf1159d2396ebbd21",
+    "02e18d90471b9d",
+    "8d801631584b6077f70e52fc18ce",
+    "a80008008a79df21209c1712db7b",
+    "a0000d908211892c2024a8c0ef3f",
+    "a80008008a79df21209c1712db7b",
+    "a0000d90b0d80030a4000046be22",
+    "a800080010030a80fd0000262f26",
+    "5d80141056ed67",
+    "8d801410586d04ef12b4b492c9f7",
+    "8d801410232473f22a0820c9d8db",
+    "02e18d90471b9d",
+    "8d8015c2581f84a56aa321e86aa4",
+    "8d801410586d04ef46b4c6f09aa2",
+    "8d80163199143c9b302010c78c96",
+    "20000d91be37de",
+    "8d8014109920cb2490382462dbee",
+    "8d8015c2581fa4a56aa33a764bc2",
+    "8d801631f82300000049b8cc3a81",
+    "8d8014109920cc24b038242e93ad",
+    "5d8015c25c9984",
+    "a00009378018ad1c00046ca54d9c",
+    "a800023ac6a95714e0740cd3ede1",
+    "8d8014109920cc24b038242e93ad",
+    "8d801631584b70773f0e393f3077",
+    "5d801631b4c3de",
+    "02e18d92470786",
+    "200003bfebe2fd",
+    "8d8015c2581ff4a56aa3897d9b18",
+    "8d8015c2232473f6e39c60aa905c",
+    "a0000410958000307c0000760003",
+    "a00004109ff9f319e26c4fab7bbb",
+    "8d8014109920ce24d04024357a51",
+    "8d801410ea30e85c575c08c27576",
+    "8d8015c299110a8050a4852e61e5",
+    "8d80163199143c9b501010d694e4",
+    "02c589380bb58d",
+    "8d801631584b8452269f8171009f",
+    "02c189383ce489",
+    "8d801631ea1b7866313c08e7dad9",
+    "8d801631584b8076130e11e02674",
+    "8d801631584b8075e70e0b5338ec",
+    "8d801631ea1b7866313c08e7dad9",
+    "8d8015c299110b8090b48452bbdd",
+    "8d8015c2ea159848015c08ad20dd",
+    "2000041fc7050d",
+    "02c189383ce489",
+    "28000800d000de",
+    "8d80163199143e9bf80c10b9d9f4",
+    "a00009389b580030a80000a4d2af",
+    "8d8015c2e1122a00000000b5bd91",
+    "8d801410586dc4f36eb636caf934",
+    "5d80141056ed67",
+    "8d801631584b8074490dd47c3505",
+    "8d801410586dd11ac3255ef2ffbe",
+    "8d801410f82300030049b8a45fc5",
+    "8d80163199143e9c580410b53fc9",
+    "02e18db046da2d",
+    "02c189383ce489",
+    "a0000db1b0d80030a400001c8008",
+    "8d801631202473f7cb5e2052e0e0",
+    "8d801631e1023a00000000d1f891"
+]
+
+### For data in data_list
+sample_msgs1=[]
+for data in data_list:
+    if len(data)==28:
+        sample_msgs1.append(data)
+
+
+
+    # "8D800D4058C38499828DEA2EC184",
+    #            "8D800D4058C38499E48DED326C5D",
+    #            "8D800D4058C3849A508DF0F45AB3",
+    #            "8D800D4058C380C00AFC3B3AD6AD",
+    #            "8D001838FFF02B3D600CE39773DB",
+    #            "8D0018388109ED30FFE400409A2D",
+    #            "*5d801631b4c3de",
+    #            "8D800D40EA4A5858013C08B589A4"]
+# #["8D800D40F82300030049B8934F3E","A8001B938119EF30E00C00DC1CE0"]#     # "8D40621D58C382D690C8AC2869A7",  # even
+#     # # "8D40621D58C386435CC412692AD6",  # odd
+#     # "8D40621D994409940838175B284F",  # velocity ST=1
+#     # "8D40621D9B06B6AF189400CBC33F",   # velocity ST=3 
+#     # "8D40621D58C386435CC412692AD6",  # odd
+#     # # "8d80163199143c9b70280fc25854",
+#     # "8D80163158C3808BE11FDBF5BF0A",  # even
+#     # "8D80163158C3846792B0CAEE14B4",  # odd
+#     # "8D801631994409940838175B284F",  # velocity ST=1
+    # "8D8016319B06B6AF189400CBC33F" 
+sample_msgs = []
+
+
+#sample_msgs= all_cleaned_msgs
+process_adsb_messages(sample_msgs1)
+# print(messages)
+# proccess_adsb_messages(messages)
